@@ -1,0 +1,138 @@
+#!/bin/bash
+# Enter the file to be processed
+read -p "Enter path to  ip neighbor output file to be processed: " IP_NEIGH_FILE
+# Define the database file to store processed identities
+DATABASE_FILE="processed_identities.db"
+
+# Ensure the database file exists
+touch "$DATABASE_FILE"
+
+# Read the output of the "ip neighbor print detail" command (or use the saved output in a file)
+ip_neighbor_output=$(cat $IP_NEIGH_FILE)
+
+# Function to check if a port is open
+check_port() {
+    local ip=$1
+    local port=$2
+    nc -z -w 1 "$ip" "$port" >/dev/null 2>&1 && echo "open" || echo "closed"
+}
+
+# Function to compare version numbers
+compare_versions() {
+    local version1=$1
+    local version2=$2
+    dpkg --compare-versions "$version1" gt "$version2" && echo "greater" || echo "not greater"
+}
+
+# Function to check if an identity has already been processed
+is_processed() {
+    local identity=$1
+    grep -qxF "$identity" "$DATABASE_FILE" && echo "yes" || echo "no"
+}
+
+# Function to mark an identity as processed
+mark_as_processed() {
+    local identity=$1
+    echo "$identity" >> "$DATABASE_FILE"
+}
+
+# Process the router data
+echo "$ip_neighbor_output" | awk '
+BEGIN { RS="\r\n\r\n"; FS="\r?\n"; OFS="\n\n" }
+{
+    interface=""; address=""; mac_address=""; identity=""; version=""; board=""; system_description="";
+
+    if ($0 ~ /interface=/) { match($0, /interface=[^ ]+/); interface=substr($0, RSTART+10, RLENGTH-10) }
+    if ($0 ~ /address=/) { match($0, /address=[^ ]+/); address=substr($0, RSTART+8, RLENGTH-8) }
+    if ($0 ~ /mac-address=/) { match($0, /mac-address=[^ ]+/); mac_address=substr($0, RSTART+12, RLENGTH-12) }
+    if ($0 ~ /identity=/) { match($0, /identity="[^"]+/); identity=substr($0, RSTART+10, RLENGTH-9) }
+    if ($0 ~ /version=/) { match($0, /version="[^ ]+/); version=substr($0, RSTART+9, RLENGTH-9) }
+    if ($0 ~ /board=/) { match($0, /board=[^ ]+/); board=substr($0, RSTART+6, RLENGTH-6) }
+    if ($0 ~ /system-description=/) { match($0, /system-description="[^"]+/); system_description=substr($0, RSTART+19, RLENGTH-19) }
+    
+    print "BLOCK_START";
+    print "Interface: " interface;
+    print "Address: " address;
+    print "MAC Address: " mac_address;
+    print "Identity: " identity;
+    print "Version: " version;
+    print "Board: " board;
+    print "System Description: " system_description;
+    print "BLOCK_END";
+}
+' | while read -r line; do
+    # Reset variables for each block
+    if [[ $line == "BLOCK_START" ]]; then
+        interface=""; address=""; mac_address=""; identity=""; version=""; board=""; system_description=""
+        continue
+    fi
+
+    if [[ $line == "BLOCK_END" ]]; then
+        # Skip if no identity is found
+        if [[ -z $identity ]]; then
+            continue
+        fi
+
+        # Check if the identity has already been processed
+        if [[ $(is_processed "$identity") == "no" ]]; then
+            # Mark identity as processed
+            mark_as_processed "$identity"
+
+            # Check ports if address is present
+            if [[ -n $address ]]; then
+                port22_status=$(check_port "$address" 22)
+                port8291_status=$(check_port "$address" 8291)
+                
+                # Sanitize version string
+                clean_version=$(echo "$version" | sed 's/[^0-9.]*//g')
+
+                result=""
+                if [[ $(compare_versions "$clean_version" "6.46") == "not greater" ]]; then
+                    if [[ $port8291_status == "open" ]]; then
+                        result="A"
+                    elif [[ $port22_status == "open" ]]; then
+                        result="B"
+                    fi
+                else
+                    if [[ $port22_status == "open" ]]; then
+                        result="C"
+                    fi
+                fi
+
+                # Print all data fields with the result
+                echo "Interface: $interface"
+                echo "Address: $address"
+                echo "MAC Address: $mac_address"
+                echo "Identity: $identity"
+                echo "Version: $version"
+                echo "Board: $board"
+                echo "System Description: $system_description"
+		echo "Port 22: $port22_status"
+		echo "Port 8291: $port8291_status"
+                echo "Result: $result"
+                echo "-------------------------"
+            fi
+        else
+            echo "Identity $identity has already been processed. Skipping..."
+        fi
+
+        continue
+    fi
+
+    # Extract fields line-by-line
+    if [[ $line == Interface:* ]]; then
+        interface=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    elif [[ $line == Address:* ]]; then
+        address=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    elif [[ $line == MAC\ Address:* ]]; then
+        mac_address=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    elif [[ $line == Identity:* ]]; then
+        identity=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    elif [[ $line == Version:* ]]; then
+        version=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    elif [[ $line == Board:* ]]; then
+        board=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    elif [[ $line == System\ Description:* ]]; then
+        system_description=$(echo "$line" | cut -d ':' -f2- | sed 's/^[ \t]*//;s/[ \t]*$//')
+    fi
+done
